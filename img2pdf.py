@@ -135,6 +135,7 @@ def detect_ocr_rotation(im: Image.Image):
         return 0
     except Exception as e:
         log_warn(f"OCR 方向检测失败：{e}")
+        log_warn(f"详细堆栈：{traceback.format_exc()}")
         return None
 
 
