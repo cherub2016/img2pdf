@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-img2pdf_v3_final.py - 智能图片转 A4 PDF 工具（EXIF 校正 + OCR 文字方向检测 + 批量处理）
+img2pdf.py - 智能图片转 A4 PDF 工具（EXIF 校正 + OCR 文字方向检测 + 批量处理）
 
 用法：
   python img2pdf.py <源目录> [输出目录]
