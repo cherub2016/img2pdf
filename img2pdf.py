@@ -1,39 +1,69 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-img2pdf.py - 智能图片转 A4 PDF 工具（EXIF 校正 + OCR 文字方向检测 + 批量处理）
 
-用法：
-  python img2pdf.py <源目录> [输出目录]
+高性能影像归档工具（v0.42）
+- 移除 OpenCV 方向检测，完全依赖 Tesseract OCR 检测图片方向
+- EXIF Orientation 优先处理
+- 并行处理多个子文件夹
+- 自然排序文件名（避免 1,10,2 的问题）
+- 可选 --pdfa 使用 Ghostscript 转换为 PDF/A-1b
 
-说明：
-  - 递归扫描源目录及其子目录；
-  - 每个含图片的目录生成一个 PDF，文件名为 <目录名>.pdf；
-  - 若指定输出目录，则所有 PDF 文件统一保存在输出目录下；
-  - 先 EXIF 校正，再 OCR 检测方向；
-  - 自动横竖页面、等比缩放、居中；
-  - 命令行日志彩色输出。
+用法:
+  python img2pdf_v4.1.py <src_dir> <out_dir> [--pdfa]
+
+依赖:
+  pip install pillow reportlab opencv-python pytesseract
+系统需安装:
+  - Tesseract OCR（仅在 OCR 兜底时使用）
+  - Ghostscript（若使用 --pdfa）
 """
 
 import os
 import sys
+import re
 import argparse
 import tempfile
 import traceback
 from io import BytesIO
-from PIL import Image, ExifTags
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import math
+
+from PIL import Image, ExifTags, ImageOps
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.utils import ImageReader
-import pytesseract
-from colorama import init as colorama_init, Fore, Style
 
-# 初始化 colorama
-colorama_init(autoreset=True)
+# OpenCV and pytesseract imports
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+# colorama optional
+try:
+    from colorama import init as colorama_init, Fore, Style
+
+    colorama_init(autoreset=True)
+except Exception:
+
+    class _C:
+        def __getattr__(self, _):
+            return ""
+
+    Fore = Style = _C()
+
 A4_W, A4_H = A4
 
 
-# ========= 日志输出函数 =========
+# ---------------- Logging ----------------
 def log_info(msg):
     print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} {msg}")
 
@@ -54,9 +84,23 @@ def log_err(msg):
     print(f"{Fore.RED}[ERR]{Style.RESET_ALL} {msg}")
 
 
-# ========= 图像处理函数 =========
+# ---------------- Natural sort ----------------
+_nat_re = re.compile(r"(\d+)")
+
+
+def natural_key(s: str):
+    parts = _nat_re.split(s)
+    key = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        else:
+            key.append(p.lower())
+    return key
+
+
+# ---------------- EXIF orientation correction ----------------
 def correct_exif_orientation(im: Image.Image) -> Image.Image:
-    """根据 EXIF Orientation 修正图像方向"""
     try:
         exif = im._getexif()
         if not exif:
@@ -77,63 +121,81 @@ def correct_exif_orientation(im: Image.Image) -> Image.Image:
     return im
 
 
+# ---------------- Tesseract OCR based rotation detection ----------------
 def detect_ocr_rotation(im: Image.Image):
-    """使用 pytesseract 检测文字方向（返回需顺时针旋转角度）"""
+    """使用 Tesseract OCR 检测图片方向（返回需顺时针旋转角度）"""
+    if pytesseract is None:
+        return None  # Tesseract not available
     try:
         osd = pytesseract.image_to_osd(im)
         for line in osd.splitlines():
             if line.startswith("Rotate:"):
                 angle = int(line.split(":")[1].strip())
-                return angle, None
-        return 0, None
+                return angle
+        return 0
     except Exception as e:
         log_warn(f"OCR 方向检测失败：{e}")
-        return 0, None
+        return None
 
 
+# ---------------- OCR fallback detection ----------------
+def detect_rotation_ocr(image_path):
+    """使用 pytesseract 的 OSD 来检测需要顺时针旋转的角度（0/90/180/270）"""
+    if pytesseract is None:
+        return 0
+    try:
+        with Image.open(image_path) as im:
+            rgb = im.convert("RGB")
+            osd = pytesseract.image_to_osd(rgb)
+            for line in osd.splitlines():
+                if line.strip().startswith("Rotate:"):
+                    angle = int(line.split(":")[1].strip())
+                    return angle % 360
+    except Exception as e:
+        log_warn(f"OCR detect failed: {e}")
+    return 0
+
+
+# ---------------- Ensure RGB ----------------
 def ensure_rgb(im: Image.Image) -> Image.Image:
-    """转换为 RGB 并去除透明背景"""
     if im.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", im.size, (255, 255, 255))
-        bg.paste(im, mask=im.split()[-1])
+        try:
+            bg.paste(im, mask=im.split()[-1])
+        except Exception:
+            bg.paste(im)
         im = bg
     elif im.mode != "RGB":
         im = im.convert("RGB")
     return im
 
 
-# ========= PDF 生成核心函数 =========
+# ---------------- Make PDF from images ----------------
 def make_pdf_from_images(img_paths, out_pdf_path):
-    """将图片序列写入 PDF"""
     out_dir = os.path.dirname(out_pdf_path)
     base_name = os.path.splitext(os.path.basename(out_pdf_path))[0]
-    temp_fd, temp_path = tempfile.mkstemp(prefix=base_name + "_", suffix=".pdf", dir=out_dir)
+    temp_fd, temp_path = tempfile.mkstemp(
+        prefix=base_name + "_", suffix=".pdf", dir=out_dir
+    )
     os.close(temp_fd)
-
     try:
         c = canvas.Canvas(temp_path, pagesize=A4)
-
         for idx, img_path in enumerate(img_paths, start=1):
             img_name = os.path.basename(img_path)
-            log_proc(f"处理 {idx}/{len(img_paths)}: {img_name}")
-
+            log_proc(f"    处理 {idx}/{len(img_paths)}: {img_name}")
             try:
                 with Image.open(img_path) as im:
-                    # Step 1: EXIF 校正
                     im = correct_exif_orientation(im)
-
-                    # Step 2: OCR 检测文字方向
-                    rot, _ = detect_ocr_rotation(im)
+                    rot = detect_ocr_rotation(im)
+                    if rot is None:
+                        rot = detect_rotation_ocr(img_path)
                     if rot not in (0, 90, 180, 270):
                         rot = 0
                     if rot != 0:
                         im = im.rotate(-rot, expand=True)
-                        log_proc(f"  OCR 建议顺时针旋转 {rot}° → 已调整")
-
+                        log_proc(f"      已按 {rot}° 旋转（顺时针）")
                     im = ensure_rgb(im)
                     w, h = im.size
-
-                    # Step 3: 页面方向
                     if w > h:
                         page_size = landscape(A4)
                         page_dir = "横向"
@@ -142,107 +204,202 @@ def make_pdf_from_images(img_paths, out_pdf_path):
                         page_dir = "竖向"
                     c.setPageSize(page_size)
                     page_w, page_h = page_size
-
-                    # Step 4: 等比缩放并居中
                     scale = min(page_w / w, page_h / h)
                     new_w, new_h = w * scale, h * scale
                     x = (page_w - new_w) / 2
                     y = (page_h - new_h) / 2
-
                     bio = BytesIO()
                     im.save(bio, format="JPEG")
                     bio.seek(0)
                     ir = ImageReader(bio)
-
-                    log_proc(f"  尺寸 {w}x{h} → {int(new_w)}x{int(new_h)} | 页面: {page_dir}")
                     c.drawImage(ir, x, y, new_w, new_h, preserveAspectRatio=True)
                     c.showPage()
                     bio.close()
-
             except Exception as e_img:
-                log_warn(f"跳过图片 {img_name}（错误：{e_img}）")
+                log_warn(f"      跳过图片 {img_name}（错误：{e_img}）")
                 traceback.print_exc()
-
+                continue
         c.save()
-        os.replace(temp_path, out_pdf_path)
-        log_save(f"生成 PDF：{out_pdf_path}")
-
-    except PermissionError:
-        log_err("无法覆盖目标文件（可能被打开）")
+        try:
+            os.replace(temp_path, out_pdf_path)
+        except PermissionError:
+            log_err(f"无法覆盖目标文件（可能被打开）：{out_pdf_path}")
+            log_err(f"临时文件保留于：{temp_path}")
+            return False
+        log_save(f"生成 PDF: {out_pdf_path}")
+        return True
     except Exception as e:
-        log_err(f"PDF 生成失败：{e}")
+        log_err(f"生成 PDF 失败：{out_pdf_path} | 错误：{e}")
         traceback.print_exc()
-    finally:
-        if os.path.exists(temp_path):
-            try:
+        try:
+            if os.path.exists(temp_path):
                 os.remove(temp_path)
-            except Exception:
-                pass
+        except Exception:
+            pass
+        return False
 
 
-# ========= 工具函数 =========
-def gather_image_files_in_dir(dir_path):
-    """返回目录中所有 jpg/jpeg 文件（按名称升序）"""
-    imgs = [
-        os.path.join(dir_path, f)
-        for f in os.listdir(dir_path)
-        if os.path.isfile(os.path.join(dir_path, f))
-        and f.lower().endswith((".jpg", ".jpeg"))
+# ---------------- Ghostscript PDF/A conversion ----------------
+def convert_to_pdfa_ghostscript(input_pdf, output_pdf):
+    import subprocess, shutil
+
+    gs_cmd = "gswin64c" if os.name == "nt" else "gs"
+    if not shutil.which(gs_cmd):
+        log_err("Ghostscript 未找到，请安装并将其加入 PATH。")
+        return False
+    cmd = [
+        gs_cmd,
+        "-dPDFA=1",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-dNOOUTERSAVE",
+        "-dUseCIEColor",
+        "-sProcessColorModel=DeviceRGB",
+        "-sDEVICE=pdfwrite",
+        "-dPDFACompatibilityPolicy=1",
+        f"-sOutputFile={output_pdf}",
+        input_pdf,
     ]
-    imgs.sort()
-    return imgs
+    log_proc("    调用 Ghostscript 进行 PDF/A 转换...")
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log_save(f"PDF/A 转换成功：{output_pdf}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log_err(
+            f"Ghostscript 转换失败：{e}; stderr: {e.stderr.decode(errors='ignore')}"
+        )
+        return False
 
 
-def process_recursive(src_root, out_root=None):
-    """递归扫描目录并生成 PDF"""
-    for current_dir, dirs, files in os.walk(src_root):
+# ---------------- Directory utilities ----------------
+def gather_image_files_in_dir(dir_path):
+    files = []
+    for fname in os.listdir(dir_path):
+        p = os.path.join(dir_path, fname)
+        if os.path.isfile(p) and fname.lower().endswith((".jpg", ".jpeg")):
+            files.append(fname)
+    files.sort(key=natural_key)
+    return [os.path.join(dir_path, f) for f in files]
+
+
+def collect_dirs_to_process(src_root):
+    dirs = []
+    for current_dir, _, _ in os.walk(src_root):
+        imgs = [
+            f
+            for f in os.listdir(current_dir)
+            if os.path.isfile(os.path.join(current_dir, f))
+            and f.lower().endswith((".jpg", ".jpeg"))
+        ]
+        if imgs:
+            dirs.append(current_dir)
+    return dirs
+
+
+def process_one_dir(args_tuple):
+    current_dir, out_root, do_pdfa = args_tuple
+    try:
         images = gather_image_files_in_dir(current_dir)
         if not images:
-            continue
-
-        log_info(f"目录: {current_dir}")
-        log_info(f"  发现 {len(images)} 张图片")
-
+            return (current_dir, False, "no_images")
         dir_name = os.path.basename(os.path.normpath(current_dir))
         pdf_name = f"{dir_name}.pdf"
-
         if out_root:
             os.makedirs(out_root, exist_ok=True)
             out_pdf = os.path.join(out_root, pdf_name)
         else:
             out_pdf = os.path.join(current_dir, pdf_name)
+        log_info(f"[{dir_name}] 开始生成 PDF（{len(images)} 张） -> {out_pdf}")
+        ok = make_pdf_from_images(images, out_pdf)
+        if not ok:
+            return (current_dir, False, "make_pdf_failed")
+        if do_pdfa:
+            tmp_fd, tmp_pdfa = tempfile.mkstemp(
+                prefix=dir_name + "_pdfa_", suffix=".pdf", dir=os.path.dirname(out_pdf)
+            )
+            os.close(tmp_fd)
+            converted = convert_to_pdfa_ghostscript(out_pdf, tmp_pdfa)
+            if converted:
+                try:
+                    os.replace(tmp_pdfa, out_pdf)
+                except Exception as e:
+                    log_warn(f"替换 PDF/A 文件失败：{e}（临时文件保留：{tmp_pdfa}）")
+                    return (current_dir, False, "pdfa_replace_failed")
+            else:
+                try:
+                    if os.path.exists(tmp_pdfa):
+                        os.remove(tmp_pdfa)
+                except Exception:
+                    pass
+                return (current_dir, False, "pdfa_convert_failed")
+        return (current_dir, True, None)
+    except Exception as e:
+        traceback.print_exc()
+        return (current_dir, False, str(e))
 
-        make_pdf_from_images(images, out_pdf)
+
+def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
+    dirs = collect_dirs_to_process(src_root)
+    total = len(dirs)
+    log_info(f"共发现 {total} 个含图片的子目录。")
+    if total == 0:
+        return
+    max_workers = min(os.cpu_count() or 1, 8)
+    log_info(f"开始并行处理（最大并发数 {max_workers}）")
+    tasks = [(d, out_root, do_pdfa) for d in dirs]
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_dir = {executor.submit(process_one_dir, t): t[0] for t in tasks}
+        completed = 0
+        for future in as_completed(future_to_dir):
+            dirpath = future_to_dir[future]
+            try:
+                current_dir, ok, reason = future.result()
+                completed += 1
+                if ok:
+                    log_save(f"[{completed}/{total}] 完成：{current_dir}")
+                else:
+                    log_warn(
+                        f"[{completed}/{total}] 失败：{current_dir} | 原因：{reason}"
+                    )
+            except Exception as e:
+                completed += 1
+                log_err(f"[{completed}/{total}] 子任务异常：{dirpath} | 错误：{e}")
 
 
-# ========= 主函数 =========
 def main():
     parser = argparse.ArgumentParser(
-        description="图片批量转 A4 PDF（EXIF 校正 + OCR 文字方向检测）。"
+        description="高性能图片转 A4 PDF（EXIF+OpenCV方向检测，OCR兜底，支持PDF/A）"
     )
     parser.add_argument("src", help="源目录（必填）")
-    parser.add_argument("out", nargs="?", default=None, help="可选输出目录，若省略则保存到源目录。")
+    parser.add_argument(
+        "out",
+        nargs="?",
+        default=None,
+        help="输出目录（可选），若指定则所有 PDF 保存到此目录",
+    )
+    parser.add_argument(
+        "--pdfa", action="store_true", help="生成后使用 Ghostscript 转为 PDF/A-1b"
+    )
     args = parser.parse_args()
-
     src = os.path.abspath(args.src)
     if not os.path.isdir(src):
         log_err(f"源目录不存在：{src}")
         sys.exit(2)
-
-    out_dir = None
-    if args.out:
-        out_dir = os.path.abspath(args.out)
+    out_dir = os.path.abspath(args.out) if args.out else None
+    if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-
     log_info(f"开始处理源目录：{src}")
     if out_dir:
         log_info(f"输出目录：{out_dir}")
     else:
-        log_info("输出目录未指定，PDF 将保存到各自子目录中。")
-
-    process_recursive(src, out_dir)
-    log_info("✅ 全部处理完成。")
+        log_info("输出目录未指定，PDF 将生成在各自源子目录中。")
+    if args.pdfa:
+        log_info("已启用 PDF/A 转换（需要 Ghostscript）")
+    process_recursive_parallel(src, out_dir, args.pdfa)
+    log_info("全部任务完成。")
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
