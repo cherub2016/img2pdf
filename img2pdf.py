@@ -130,9 +130,16 @@ def detect_ocr_rotation(im: Image.Image):
                 angle = int(line.split(":")[1].strip())
                 return angle
         return 0
+    except pytesseract.TesseractError as e:
+        # 仅记录简短错误信息，不输出堆栈
+        err_msg = str(e).split("\n")[0] if "\n" in str(e) else str(e)
+        if "Too few characters" in err_msg:
+            log_warn("OCR 方向检测：图片文字太少，跳过")
+        else:
+            log_warn(f"OCR 方向检测失败：{err_msg}")
+        return None
     except Exception as e:
-        log_warn(f"OCR 方向检测失败：{e}")
-        log_warn(f"详细堆栈：{traceback.format_exc()}")
+        log_warn(f"OCR 方向检测异常：{e.__class__.__name__}")
         return None
 
 
