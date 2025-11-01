@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-
 高性能影像归档工具（v0.42）
-- 移除 OpenCV 方向检测，完全依赖 Tesseract OCR 检测图片方向
 - EXIF Orientation 优先处理
+- 使用 Tesseract OCR 作为方向检测兜底（若安装）
 - 并行处理多个子文件夹
 - 自然排序文件名（避免 1,10,2 的问题）
 - 可选 --pdfa 使用 Ghostscript 转换为 PDF/A-1b
 
 用法:
-  python img2pdf_v4.1.py <src_dir> <out_dir> [--pdfa]
+    python img2pdf.py <src_dir> <out_dir> [--pdfa]
 
 依赖:
-  pip install pillow reportlab opencv-python pytesseract
+    pip install pillow reportlab pytesseract
 系统需安装:
-  - Tesseract OCR（仅在 OCR 兜底时使用）
-  - Ghostscript（若使用 --pdfa）
+    - Tesseract OCR（仅在 OCR 兜底时使用）
+    - Ghostscript（若使用 --pdfa）
 """
 
 import os
@@ -26,12 +25,10 @@ import argparse
 import tempfile
 import traceback
 from io import BytesIO
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
-import math
 
-from PIL import Image, ExifTags, ImageOps
+from PIL import Image, ExifTags
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.utils import ImageReader
@@ -370,7 +367,7 @@ def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="高性能图片转 A4 PDF（EXIF+OpenCV方向检测，OCR兜底，支持PDF/A）"
+        description="高性能图片转 A4 PDF（EXIF+OCR方向检测，支持PDF/A）"
     )
     parser.add_argument("src", help="源目录（必填）")
     parser.add_argument(
