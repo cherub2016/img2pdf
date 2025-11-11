@@ -1,0 +1,103 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2025-11-11T08:09:54.816Z
+provider: 
+---
+
+# img2pdf 项目编码规范
+
+## 适用范围
+适用于 img2df 项目的所有 Python 代码，包括核心功能模块、工具函数和测试代码。
+
+## 规则条款
+
+### 1. 版本管理
+- 每次重大功能更新必须更新文档中的版本号
+- 版本号格式为 v0.xx，其中 xx 为两位数字
+- 更新版本号时必须在文档中添加新功能说明
+
+### 2. 资源管理
+- 必须使用上下文管理器 (`with` 语句) 处理临时文件和内存资源
+- 禁止使用 `tempfile.mkstemp()` 后立即关闭文件描述符
+- 必须使用 `tempfile.NamedTemporaryFile` 替代 `tempfile.mkstemp`
+- 所有 `BytesIO` 对象必须使用上下文管理器确保资源释放
+
+### 3. 异常处理
+- 禁止使用裸 `except Exception` 捕获所有异常
+- 必须明确捕获特定异常类型（如 `AttributeError`, `ValueError`, `TypeError`）
+- 异常日志必须包含足够的上下文信息
+- 子进程异常必须记录详细错误信息和堆栈跟踪
+
+### 4. 图像处理
+- 支持的图像格式必须包括：`.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.tif`
+- 图像保存时必须指定质量参数（推荐 JPEG 质量为 85）
+- OCR 检测必须优先使用内存中的图像，失败后才重新打开文件
+
+### 5. 输入验证
+- 必须验证源目录存在性和可读权限
+- 必须验证输出目录可写权限
+- 权限检查失败必须使用明确的退出代码（2-4）
+- 所有路径必须使用 `os.path.abspath()` 转换为绝对路径
+
+### 6. 代码组织
+- 函数必须包含类型提示（如 `im: Image.Image`）
+- 函数必须有文档字符串说明功能
+- 代码必须按功能模块分组，使用注释分隔
+- 导入语句必须按标准库、第三方库、本地模块的顺序排列
+
+## 正例
+
+```python
+# 资源管理
+with tempfile.NamedTemporaryFile(prefix="temp_", suffix=".pdf", delete=False) as temp_file:
+    temp_path = temp_file.name
+
+# 异常处理
+try:
+    exif = im._getexif()
+except (AttributeError, ValueError, TypeError) as e:
+    log_warn(f"EXIF 方向校正失败: {e}")
+
+# 图像处理
+with BytesIO() as bio:
+    im.save(bio, format="JPEG", quality=85)
+    bio.seek(0)
+    ir = ImageReader(bio)
+```
+
+## 反例
+
+```python
+# 错误的资源管理
+temp_fd, temp_path = tempfile.mkstemp(prefix="temp_", suffix=".pdf")
+os.close(temp_fd)
+
+# 错误的异常处理
+try:
+    exif = im._getexif()
+except Exception:
+    pass
+
+# 错误的图像处理
+bio = BytesIO()
+im.save(bio, format="JPEG")
+bio.seek(0)
+ir = ImageReader(bio)
+bio.close()
+```
+
+## 落地检查清单
+- [ ] 版本号是否已更新并添加新功能说明
+- [ ] 所有临时文件是否使用上下文管理器
+- [ ] 所有 BytesIO 对象是否使用上下文管理器
+- [ ] 异常处理是否明确指定异常类型
+- [ ] 是否支持所有必需的图像格式
+- [ ] 是否验证了输入目录和输出目录的权限
+- [ ] 函数是否包含类型提示和文档字符串
+
+## 关联参考
+- Python 官方文档：https://docs.python.org/3/
+- Pillow 文档：https://pillow.readthedocs.io/
+- ReportLab 文档：https://www.reportlab.com/opensource/

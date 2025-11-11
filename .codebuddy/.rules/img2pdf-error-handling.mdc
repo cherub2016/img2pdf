@@ -1,0 +1,117 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2025-11-11T08:10:35.826Z
+provider: 
+---
+
+# img2pdf 错误处理规范
+
+## 适用范围
+适用于 img2pdf 项目中所有可能产生错误的代码路径，特别是文件操作、图像处理和外部依赖调用。
+
+## 规则条款
+
+### 1. 文件操作错误处理
+- 必须检查文件/目录存在性后再操作
+- 必须验证文件/目录权限（读/写）
+- 文件操作失败必须提供明确的错误信息
+- 临时文件操作失败必须保留临时文件路径供调试
+
+### 2. 图像处理错误处理
+- 图像打开失败必须记录文件名和具体错误
+- 图像格式不支持必须跳过并记录警告
+- EXIF 数据读取失败必须记录但不中断处理
+- OCR 处理失败必须区分不同错误类型（文字太少、OCR不可用等）
+
+### 3. 外部依赖错误处理
+- Tesseract 不可用必须优雅降级，不影响主流程
+- Ghostscript 不可用必须提供明确的安装指导
+- 子进程调用失败必须记录标准错误输出
+- 可选依赖缺失必须提供友好的提示信息
+
+### 4. 并行处理错误处理
+- 子任务异常必须记录详细错误信息和堆栈跟踪
+- 并行处理失败必须不影响其他子任务
+- 进程池异常必须正确清理资源
+- 必须统计并报告成功/失败的任务数量
+
+### 5. 用户输入错误处理
+- 命令行参数错误必须显示使用帮助
+- 路径不存在必须显示明确错误信息
+- 权限不足必须提供解决方案提示
+- 必须使用不同的退出代码区分不同错误类型
+
+## 正例
+
+```python
+# 文件操作错误处理
+if not os.path.isdir(src):
+    log_err(f"源目录不存在：{src}")
+    sys.exit(2)
+
+if not os.access(src, os.R_OK):
+    log_err(f"源目录无读取权限：{src}")
+    sys.exit(3)
+
+# 图像处理错误处理
+try:
+    with Image.open(img_path) as im:
+        # 处理图像
+except Exception as e_img:
+    log_warn(f"跳过图片 {img_name}（错误：{e_img}）")
+    continue
+
+# 外部依赖错误处理
+if pytesseract is None:
+    log_warn("Tesseract OCR 不可用，跳过 OCR 检测")
+    return None
+
+# 并行处理错误处理
+try:
+    current_dir, ok, reason = future.result()
+    if ok:
+        log_save(f"[{completed}/{total}] 完成：{current_dir}")
+    else:
+        log_warn(f"[{completed}/{total}] 失败：{current_dir} | 原因：{reason}")
+except Exception as e:
+    log_err(f"[{completed}/{total}] 子任务异常：{dirpath}")
+    log_err(f"详细错误：{e}")
+    log_err(f"堆栈跟踪：{traceback.format_exc()}")
+```
+
+## 反例
+
+```python
+# 错误的文件操作
+os.makedirs(out_dir)  # 未检查权限
+
+# 错误的图像处理
+try:
+    with Image.open(img_path) as im:
+        # 处理图像
+except:  # 裸异常捕获
+    pass
+
+# 错误的外部依赖处理
+pytesseract.image_to_osd(im)  # 未检查可用性
+
+# 错误的并行处理
+try:
+    result = future.result()
+except Exception as e:
+    print(f"Error: {e}")  # 信息不足
+```
+
+## 落地检查清单
+- [ ] 所有文件操作是否检查了存在性和权限
+- [ ] 图像处理错误是否记录了文件名和具体错误
+- [ ] 外部依赖是否检查了可用性
+- [ ] 并行处理错误是否记录了详细信息和堆栈跟踪
+- [ ] 用户输入错误是否提供了明确的错误代码和提示
+- [ ] 是否使用了不同的退出代码区分错误类型
+
+## 关联参考
+- Python 错误处理最佳实践：https://docs.python.org/3/tutorial/errors.html
+- Pillow 异常处理文档：https://pillow.readthedocs.io/en/stable/reference/Image.html

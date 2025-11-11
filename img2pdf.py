@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能影像归档工具（v0.42）
+高性能影像归档工具（v0.44）
 - EXIF Orientation 优先处理
 - 使用 Tesseract OCR 作为方向检测兜底（若安装）
 - 并行处理多个子文件夹
 - 自然排序文件名（避免 1,10,2 的问题）
 - 可选 --pdfa 使用 Ghostscript 转换为 PDF/A-1b
+- 支持更多图像格式（PNG, BMP, TIFF）
+- 改进资源管理和错误处理
+- 添加运行时间统计功能
 
 用法:
     python img2pdf.py <src_dir> <out_dir> [--pdfa]
@@ -24,6 +27,7 @@ import re
 import argparse
 import tempfile
 import traceback
+import time
 from io import BytesIO
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -113,8 +117,8 @@ def correct_exif_orientation(im: Image.Image) -> Image.Image:
                 im = im.rotate(270, expand=True)
             elif orientation == 8:
                 im = im.rotate(90, expand=True)
-    except Exception:
-        pass
+    except (AttributeError, ValueError, TypeError) as e:
+        log_warn(f"EXIF 方向校正失败: {e}")
     return im
 
 
@@ -177,12 +181,15 @@ def ensure_rgb(im: Image.Image) -> Image.Image:
 
 # ---------------- Make PDF from images ----------------
 def make_pdf_from_images(img_paths, out_pdf_path):
+    # 记录开始时间
+    start_time = time.time()
     out_dir = os.path.dirname(out_pdf_path)
     base_name = os.path.splitext(os.path.basename(out_pdf_path))[0]
-    temp_fd, temp_path = tempfile.mkstemp(
-        prefix=base_name + "_", suffix=".pdf", dir=out_dir
-    )
-    os.close(temp_fd)
+    # 使用上下文管理器确保临时文件正确处理
+    with tempfile.NamedTemporaryFile(
+        prefix=base_name + "_", suffix=".pdf", dir=out_dir, delete=False
+    ) as temp_file:
+        temp_path = temp_file.name
     try:
         c = canvas.Canvas(temp_path, pagesize=A4)
         for idx, img_path in enumerate(img_paths, start=1):
@@ -191,8 +198,10 @@ def make_pdf_from_images(img_paths, out_pdf_path):
             try:
                 with Image.open(img_path) as im:
                     im = correct_exif_orientation(im)
+                    # 优先使用内存中的图像进行 OCR 检测
                     rot = detect_ocr_rotation(im)
-                    if rot is None:
+                    if rot is None and pytesseract is not None:
+                        # 如果内存检测失败，尝试重新打开文件检测
                         rot = detect_rotation_ocr(img_path)
                     if rot not in (0, 90, 180, 270):
                         rot = 0
@@ -213,13 +222,13 @@ def make_pdf_from_images(img_paths, out_pdf_path):
                     new_w, new_h = w * scale, h * scale
                     x = (page_w - new_w) / 2
                     y = (page_h - new_h) / 2
-                    bio = BytesIO()
-                    im.save(bio, format="JPEG")
-                    bio.seek(0)
-                    ir = ImageReader(bio)
-                    c.drawImage(ir, x, y, new_w, new_h, preserveAspectRatio=True)
-                    c.showPage()
-                    bio.close()
+                    # 使用上下文管理器确保 BytesIO 资源正确释放
+                    with BytesIO() as bio:
+                        im.save(bio, format="JPEG", quality=85)  # 添加质量参数减少文件大小
+                        bio.seek(0)
+                        ir = ImageReader(bio)
+                        c.drawImage(ir, x, y, new_w, new_h, preserveAspectRatio=True)
+                        c.showPage()
             except Exception as e_img:
                 log_warn(f"      跳过图片 {img_name}（错误：{e_img}）")
                 traceback.print_exc()
@@ -231,7 +240,9 @@ def make_pdf_from_images(img_paths, out_pdf_path):
             log_err(f"无法覆盖目标文件（可能被打开）：{out_pdf_path}")
             log_err(f"临时文件保留于：{temp_path}")
             return False
-        log_save(f"生成 PDF: {out_pdf_path}")
+        # 计算并记录处理时间
+        elapsed_time = time.time() - start_time
+        log_save(f"生成 PDF: {out_pdf_path} (耗时: {elapsed_time:.2f}秒)")
         return True
     except Exception as e:
         log_err(f"生成 PDF 失败：{out_pdf_path} | 错误：{e}")
@@ -280,9 +291,11 @@ def convert_to_pdfa_ghostscript(input_pdf, output_pdf):
 # ---------------- Directory utilities ----------------
 def gather_image_files_in_dir(dir_path):
     files = []
+    # 支持更多常见图像格式
+    supported_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif")
     for fname in os.listdir(dir_path):
         p = os.path.join(dir_path, fname)
-        if os.path.isfile(p) and fname.lower().endswith((".jpg", ".jpeg")):
+        if os.path.isfile(p) and fname.lower().endswith(supported_extensions):
             files.append(fname)
     files.sort(key=natural_key)
     return [os.path.join(dir_path, f) for f in files]
@@ -290,12 +303,14 @@ def gather_image_files_in_dir(dir_path):
 
 def collect_dirs_to_process(src_root):
     dirs = []
+    # 支持更多常见图像格式
+    supported_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif")
     for current_dir, _, _ in os.walk(src_root):
         imgs = [
             f
             for f in os.listdir(current_dir)
             if os.path.isfile(os.path.join(current_dir, f))
-            and f.lower().endswith((".jpg", ".jpeg"))
+            and f.lower().endswith(supported_extensions)
         ]
         if imgs:
             dirs.append(current_dir)
@@ -303,6 +318,8 @@ def collect_dirs_to_process(src_root):
 
 
 def process_one_dir(args_tuple):
+    # 记录单个目录处理开始时间
+    dir_start_time = time.time()
     current_dir, out_root, do_pdfa = args_tuple
     try:
         images = gather_image_files_in_dir(current_dir)
@@ -320,10 +337,11 @@ def process_one_dir(args_tuple):
         if not ok:
             return (current_dir, False, "make_pdf_failed")
         if do_pdfa:
-            tmp_fd, tmp_pdfa = tempfile.mkstemp(
-                prefix=dir_name + "_pdfa_", suffix=".pdf", dir=os.path.dirname(out_pdf)
-            )
-            os.close(tmp_fd)
+            # 使用上下文管理器确保临时文件正确处理
+            with tempfile.NamedTemporaryFile(
+                prefix=dir_name + "_pdfa_", suffix=".pdf", dir=os.path.dirname(out_pdf), delete=False
+            ) as tmp_file:
+                tmp_pdfa = tmp_file.name
             converted = convert_to_pdfa_ghostscript(out_pdf, tmp_pdfa)
             if converted:
                 try:
@@ -338,6 +356,10 @@ def process_one_dir(args_tuple):
                 except Exception:
                     pass
                 return (current_dir, False, "pdfa_convert_failed")
+        # 计算并记录单个目录处理时间
+        dir_elapsed_time = time.time() - dir_start_time
+        dir_name = os.path.basename(os.path.normpath(current_dir))
+        log_save(f"[{dir_name}] 处理完成 (耗时: {dir_elapsed_time:.2f}秒)")
         return (current_dir, True, None)
     except Exception as e:
         traceback.print_exc()
@@ -345,6 +367,8 @@ def process_one_dir(args_tuple):
 
 
 def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
+    # 记录总处理开始时间
+    total_start_time = time.time()
     dirs = collect_dirs_to_process(src_root)
     total = len(dirs)
     log_info(f"共发现 {total} 个含图片的子目录。")
@@ -369,7 +393,13 @@ def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
                     )
             except Exception as e:
                 completed += 1
-                log_err(f"[{completed}/{total}] 子任务异常：{dirpath} | 错误：{e}")
+                log_err(f"[{completed}/{total}] 子任务异常：{dirpath}")
+                log_err(f"详细错误：{e}")
+                log_err(f"堆栈跟踪：{traceback.format_exc()}")
+    
+    # 计算并记录总处理时间
+    total_elapsed_time = time.time() - total_start_time
+    log_info(f"所有任务完成，总耗时: {total_elapsed_time:.2f}秒")
 
 
 def main():
@@ -391,9 +421,19 @@ def main():
     if not os.path.isdir(src):
         log_err(f"源目录不存在：{src}")
         sys.exit(2)
+    
+    # 检查目录可读权限
+    if not os.access(src, os.R_OK):
+        log_err(f"源目录无读取权限：{src}")
+        sys.exit(3)
+        
     out_dir = os.path.abspath(args.out) if args.out else None
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+        # 检查输出目录可写权限
+        if not os.access(out_dir, os.W_OK):
+            log_err(f"输出目录无写入权限：{out_dir}")
+            sys.exit(4)
     log_info(f"开始处理源目录：{src}")
     if out_dir:
         log_info(f"输出目录：{out_dir}")
@@ -402,7 +442,6 @@ def main():
     if args.pdfa:
         log_info("已启用 PDF/A 转换（需要 Ghostscript）")
     process_recursive_parallel(src, out_dir, args.pdfa)
-    log_info("全部任务完成。")
 
 
 if __name__ == "__main__":
