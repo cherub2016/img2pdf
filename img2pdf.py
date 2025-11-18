@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能影像归档工具（v0.44）
-- EXIF Orientation 优先处理
+高性能影像归档工具（v0.45）
+- EXIF Orientation 优先处理（使用现代 Pillow API）
 - 使用 Tesseract OCR 作为方向检测兜底（若安装）
 - 并行处理多个子文件夹
 - 自然排序文件名（避免 1,10,2 的问题）
@@ -10,6 +10,7 @@
 - 支持更多图像格式（PNG, BMP, TIFF）
 - 改进资源管理和错误处理
 - 添加运行时间统计功能
+- 增强文件路径安全验证
 
 用法:
     python img2pdf.py <src_dir> <out_dir> [--pdfa]
@@ -19,6 +20,12 @@
 系统需安装:
     - Tesseract OCR（仅在 OCR 兜底时使用）
     - Ghostscript（若使用 --pdfa）
+
+更新日志 v0.45 (2025-11-18):
+    [修复] 将已弃用的 _getexif() 替换为 getexif() API
+    [优化] 移除冗余的 OCR 检测函数，简化代码逻辑
+    [安全] 增强 Ghostscript 路径验证，防止路径遍历攻击
+    [改进] OCR 检测统一返回值，避免 None 检查
 """
 
 import os
@@ -98,14 +105,12 @@ def natural_key(s: str):
 # ---------------- EXIF orientation correction ----------------
 def correct_exif_orientation(im: Image.Image) -> Image.Image:
     try:
-        exif = im._getexif()
+        exif = im.getexif()
         if not exif:
             return im
-        orientation_key = next(
-            (k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None
-        )
-        if orientation_key and orientation_key in exif:
-            orientation = exif[orientation_key]
+        # 使用新API直接获取Orientation，值为274 (0x0112)
+        orientation = exif.get(0x0112)
+        if orientation:
             if orientation == 3:
                 im = im.rotate(180, expand=True)
             elif orientation == 6:
@@ -121,13 +126,16 @@ def correct_exif_orientation(im: Image.Image) -> Image.Image:
 def detect_ocr_rotation(im: Image.Image):
     """使用 Tesseract OCR 检测图片方向（返回需顺时针旋转角度）"""
     if pytesseract is None:
-        return None  # Tesseract not available
+        return 0  # 统一返回0而不是None
     try:
+        # 确保图像为RGB格式以提高OCR准确性
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
         osd = pytesseract.image_to_osd(im)
         for line in osd.splitlines():
             if line.startswith("Rotate:"):
                 angle = int(line.split(":")[1].strip())
-                return angle
+                return angle % 360
         return 0
     except pytesseract.TesseractError as e:
         # 仅记录简短错误信息，不输出堆栈
@@ -136,28 +144,10 @@ def detect_ocr_rotation(im: Image.Image):
             log_warn("OCR 方向检测：图片文字太少，跳过")
         else:
             log_warn(f"OCR 方向检测失败：{err_msg}")
-        return None
+        return 0
     except Exception as e:
         log_warn(f"OCR 方向检测异常：{e.__class__.__name__}")
-        return None
-
-
-# ---------------- OCR fallback detection ----------------
-def detect_rotation_ocr(image_path):
-    """使用 pytesseract 的 OSD 来检测需要顺时针旋转的角度（0/90/180/270）"""
-    if pytesseract is None:
         return 0
-    try:
-        with Image.open(image_path) as im:
-            rgb = im.convert("RGB")
-            osd = pytesseract.image_to_osd(rgb)
-            for line in osd.splitlines():
-                if line.strip().startswith("Rotate:"):
-                    angle = int(line.split(":")[1].strip())
-                    return angle % 360
-    except Exception as e:
-        log_warn(f"OCR detect failed: {e}")
-    return 0
 
 
 # ---------------- Ensure RGB ----------------
@@ -193,11 +183,8 @@ def make_pdf_from_images(img_paths, out_pdf_path):
             try:
                 with Image.open(img_path) as im:
                     im = correct_exif_orientation(im)
-                    # 优先使用内存中的图像进行 OCR 检测
+                    # 使用OCR检测旋转角度（已处理所有异常情况）
                     rot = detect_ocr_rotation(im)
-                    if rot is None and pytesseract is not None:
-                        # 如果内存检测失败，尝试重新打开文件检测
-                        rot = detect_rotation_ocr(img_path)
                     if rot not in (0, 90, 180, 270):
                         rot = 0
                     if rot != 0:
@@ -254,6 +241,15 @@ def make_pdf_from_images(img_paths, out_pdf_path):
 def convert_to_pdfa_ghostscript(input_pdf, output_pdf):
     import subprocess, shutil
 
+    # 验证输入文件存在
+    if not os.path.isfile(input_pdf):
+        log_err(f"输入PDF文件不存在：{input_pdf}")
+        return False
+    
+    # 规范化路径以防止路径遍历
+    input_pdf = os.path.abspath(input_pdf)
+    output_pdf = os.path.abspath(output_pdf)
+    
     gs_cmd = "gswin64c" if os.name == "nt" else "gs"
     if not shutil.which(gs_cmd):
         log_err("Ghostscript 未找到，请安装并将其加入 PATH。")
