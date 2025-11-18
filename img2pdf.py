@@ -37,12 +37,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.utils import ImageReader
 
-# OpenCV and pytesseract imports
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
+# pytesseract import
 try:
     import pytesseract
 except Exception:
