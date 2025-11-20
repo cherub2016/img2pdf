@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能影像归档工具（v0.45）
+高性能影像归档工具（v0.46）
 - EXIF Orientation 优先处理（使用现代 Pillow API）
 - 使用 Tesseract OCR 作为方向检测兜底（若安装）
 - 并行处理多个子文件夹
@@ -11,6 +11,7 @@
 - 改进资源管理和错误处理
 - 添加运行时间统计功能
 - 增强文件路径安全验证
+- 智能跳过已存在的PDF文件
 
 用法:
     python img2pdf.py <src_dir> <out_dir> [--pdfa]
@@ -20,12 +21,6 @@
 系统需安装:
     - Tesseract OCR（仅在 OCR 兜底时使用）
     - Ghostscript（若使用 --pdfa）
-
-更新日志 v0.45 (2025-11-18):
-    [修复] 将已弃用的 _getexif() 替换为 getexif() API
-    [优化] 移除冗余的 OCR 检测函数，简化代码逻辑
-    [安全] 增强 Ghostscript 路径验证，防止路径遍历攻击
-    [改进] OCR 检测统一返回值，避免 None 检查
 """
 
 import os
@@ -323,6 +318,12 @@ def process_one_dir(args_tuple):
             out_pdf = os.path.join(out_root, pdf_name)
         else:
             out_pdf = os.path.join(current_dir, pdf_name)
+        
+        # 检查目标PDF是否已存在
+        if os.path.exists(out_pdf):
+            log_info(f"[{dir_name}] 跳过：PDF 已存在 -> {out_pdf}")
+            return (current_dir, True, "skipped_existing")
+        
         log_info(f"[{dir_name}] 开始生成 PDF（{len(images)} 张） -> {out_pdf}")
         ok = make_pdf_from_images(images, out_pdf)
         if not ok:
@@ -377,7 +378,10 @@ def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
                 current_dir, ok, reason = future.result()
                 completed += 1
                 if ok:
-                    log_save(f"[{completed}/{total}] 完成：{current_dir}")
+                    if reason == "skipped_existing":
+                        log_info(f"[{completed}/{total}] 跳过：{current_dir}")
+                    else:
+                        log_save(f"[{completed}/{total}] 完成：{current_dir}")
                 else:
                     log_warn(
                         f"[{completed}/{total}] 失败：{current_dir} | 原因：{reason}"
