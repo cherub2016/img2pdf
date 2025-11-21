@@ -504,9 +504,18 @@ def process_one_dir(args_tuple):
         
         if out_root:
             if keep_structure:
-                # 保持目录结构：计算相对路径
+                # 保持目录结构：PDF输出到图片文件夹的父目录（相对于源根目录）
                 rel_path = os.path.relpath(current_dir, src_root)
-                out_dir = os.path.join(out_root, rel_path)
+                # 如果当前目录就是源根目录，直接输出到 out_root
+                if rel_path == ".":
+                    out_dir = out_root
+                else:
+                    # 获取父目录的相对路径
+                    parent_rel_path = os.path.dirname(rel_path)
+                    if parent_rel_path:
+                        out_dir = os.path.join(out_root, parent_rel_path)
+                    else:
+                        out_dir = out_root
                 os.makedirs(out_dir, exist_ok=True)
                 out_pdf = os.path.join(out_dir, pdf_name)
             else:
