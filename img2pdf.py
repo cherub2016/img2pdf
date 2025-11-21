@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能影像归档工具（v0.46）
-- EXIF Orientation 优先处理（使用现代 Pillow API）
-- 使用 Tesseract OCR 作为方向检测兜底（若安装）
-- 并行处理多个子文件夹
-- 自然排序文件名（避免 1,10,2 的问题）
-- 可选 --pdfa 使用 Ghostscript 转换为 PDF/A-1b
-- 支持更多图像格式（PNG, BMP, TIFF）
-- 改进资源管理和错误处理
-- 添加运行时间统计功能
-- 增强文件路径安全验证
-- 智能跳过已存在的PDF文件
+高性能影像归档工具 (v0.47)
 
-用法:
-    python img2pdf.py <src_dir> <out_dir> [--pdfa]
+批量将图片转换为A4格式PDF，支持EXIF方向校正、OCR文字检测、
+压缩包自动解压、并行处理、PDF/A标准转换等功能。
 
-依赖:
-    pip install pillow reportlab pytesseract
-系统需安装:
-    - Tesseract OCR（仅在 OCR 兜底时使用）
-    - Ghostscript（若使用 --pdfa）
+详细文档请参考 README.md
 """
 
 import os
@@ -30,8 +16,10 @@ import argparse
 import tempfile
 import traceback
 import time
+import zipfile
 from io import BytesIO
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 import multiprocessing
 
 from PIL import Image, ExifTags
@@ -41,7 +29,7 @@ from reportlab.lib.utils import ImageReader
 
 # pytesseract import
 try:
-    import pytesseract
+    import pytesseract  # type: ignore[import-untyped]
 except Exception:
     pytesseract = None
 
@@ -95,6 +83,194 @@ def natural_key(s: str):
         else:
             key.append(p.lower())
     return key
+
+
+# ---------------- Archive extraction ----------------
+ARCHIVE_EXTENSIONS = ('.zip', '.rar', '.7z', '.tar', '.tar.gz', '.tar.bz2')
+
+
+def is_archive(filename):
+    """检查文件是否为支持的压缩包格式"""
+    return filename.lower().endswith(ARCHIVE_EXTENSIONS)
+
+
+def get_extract_folder_name(archive_path):
+    """
+    获取解压目标文件夹名称
+    
+    示例：
+    - 报销单.zip -> 报销单
+    - 发票2024.rar -> 发票2024
+    - archive.tar.gz -> archive
+    """
+    basename = os.path.basename(archive_path)
+    
+    # 处理双扩展名
+    if basename.lower().endswith('.tar.gz'):
+        return basename[:-7]
+    elif basename.lower().endswith('.tar.bz2'):
+        return basename[:-8]
+    else:
+        return os.path.splitext(basename)[0]
+
+
+def is_safe_extract_path(path, base_dir):
+    """检查解压路径是否安全（防止路径遍历攻击）"""
+    abs_path = os.path.abspath(os.path.join(base_dir, path))
+    abs_base = os.path.abspath(base_dir)
+    return abs_path.startswith(abs_base)
+
+
+def extract_zip(archive_path, target_dir):
+    """解压 ZIP 文件"""
+    try:
+        with zipfile.ZipFile(archive_path, 'r') as zf:
+            # 安全检查：防止路径遍历攻击
+            for name in zf.namelist():
+                if '..' in name or name.startswith('/') or name.startswith('\\'):
+                    return (False, f"不安全的文件路径: {name}")
+            
+            # 检查解压后总大小（防止 Zip Bomb）
+            total_size = sum(info.file_size for info in zf.infolist())
+            if total_size > 10 * 1024 * 1024 * 1024:  # 10GB
+                return (False, "解压后文件过大（可能是 Zip Bomb）")
+            
+            zf.extractall(target_dir)
+        
+        return (True, None)
+    except zipfile.BadZipFile:
+        return (False, "损坏的ZIP文件")
+    except Exception as e:
+        return (False, str(e))
+
+
+def extract_archive(archive_path, target_dir):
+    """
+    统一解压接口
+    
+    当前仅支持 ZIP 格式（Python 内置，无需额外依赖）
+    未来可扩展支持 RAR、7Z 等格式
+    """
+    ext = os.path.splitext(archive_path.lower())[1]
+    
+    if ext == '.zip':
+        return extract_zip(archive_path, target_dir)
+    else:
+        return (False, f"暂不支持的格式: {ext}（当前仅支持 .zip）")
+
+
+def extract_all_archives(src_dir):
+    """
+    批量解压源目录中的所有压缩包
+    
+    返回：(成功数, 跳过数, 失败数, 映射字典)
+    """
+    archives = []
+    
+    # 递归查找所有压缩包
+    for root, _, files in os.walk(src_dir):
+        for file in files:
+            if is_archive(file):
+                archives.append(os.path.join(root, file))
+    
+    if not archives:
+        log_info("未发现压缩包，跳过解压步骤")
+        return (0, 0, 0, {})
+    
+    log_info(f"发现 {len(archives)} 个压缩包")
+    
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    archive_mapping = {}  # 文件夹 -> 压缩包 映射
+    
+    for archive_path in archives:
+        archive_name = os.path.basename(archive_path)
+        folder_name = get_extract_folder_name(archive_path)
+        parent_dir = os.path.dirname(archive_path)
+        target_dir = os.path.join(parent_dir, folder_name)
+        
+        # 检查目标文件夹是否已存在
+        if os.path.exists(target_dir):
+            log_info(f"⏭️  跳过：{archive_name}（文件夹已存在）")
+            skip_count += 1
+            # 即使跳过，也记录映射关系（可能需要后续删除）
+            archive_mapping[target_dir] = archive_path
+            continue
+        
+        log_proc(f"📦 解压：{archive_name} -> {folder_name}/")
+        
+        success, error_msg = extract_archive(archive_path, target_dir)
+        
+        if success:
+            # 验证解压结果
+            if not os.path.exists(target_dir) or not os.listdir(target_dir):
+                log_warn(f"❌ 解压失败：{archive_name}（目标目录为空）")
+                fail_count += 1
+            else:
+                file_count = len(os.listdir(target_dir))
+                log_save(f"✅ 解压完成：{folder_name}/ ({file_count} 个文件)")
+                success_count += 1
+                # 记录映射关系
+                archive_mapping[target_dir] = archive_path
+        else:
+            log_warn(f"❌ 解压失败：{archive_name}（{error_msg}）")
+            fail_count += 1
+    
+    log_info(f"解压统计：成功 {success_count}, 跳过 {skip_count}, 失败 {fail_count}")
+    return (success_count, skip_count, fail_count, archive_mapping)
+
+
+def find_source_archive(extracted_dir, archive_mapping):
+    """
+    查找解压目录对应的原始压缩包
+    
+    优先使用映射字典，如果找不到则尝试自动查找
+    """
+    # 优先使用映射字典
+    if extracted_dir in archive_mapping:
+        return archive_mapping[extracted_dir]
+    
+    # 备用方案：尝试自动查找
+    parent_dir = os.path.dirname(extracted_dir)
+    folder_name = os.path.basename(extracted_dir)
+    
+    for ext in ['.zip', '.rar', '.7z', '.tar', '.tar.gz', '.tar.bz2']:
+        archive_path = os.path.join(parent_dir, folder_name + ext)
+        if os.path.isfile(archive_path):
+            return archive_path
+    
+    return None
+
+
+def safe_delete_archive(archive_path, pdf_path):
+    """
+    安全删除压缩包（带验证）
+    
+    检查：
+    1. PDF 文件存在
+    2. PDF 文件大小 > 1KB
+    """
+    # 检查 PDF 是否存在
+    if not os.path.isfile(pdf_path):
+        log_warn(f"PDF不存在，跳过删除压缩包：{os.path.basename(archive_path)}")
+        return False
+    
+    # 检查 PDF 大小
+    pdf_size = os.path.getsize(pdf_path)
+    if pdf_size < 1024:
+        log_warn(f"PDF文件过小（{pdf_size} 字节），跳过删除压缩包：{os.path.basename(archive_path)}")
+        return False
+    
+    # 删除压缩包
+    try:
+        os.remove(archive_path)
+        archive_size = os.path.getsize(archive_path) if os.path.exists(archive_path) else 0
+        log_save(f"🗑️  已删除压缩包：{os.path.basename(archive_path)}")
+        return True
+    except Exception as e:
+        log_warn(f"删除压缩包失败：{os.path.basename(archive_path)} ({e})")
+        return False
 
 
 # ---------------- EXIF orientation correction ----------------
@@ -195,7 +371,19 @@ def make_pdf_from_images(img_paths, out_pdf_path):
                         page_dir = "竖向"
                     c.setPageSize(page_size)
                     page_w, page_h = page_size
-                    scale = min(page_w / w, page_h / h)
+                    
+                    # 横向页面增加边距（15mm ≈ 42.5磅），竖向页面不加边距
+                    if w > h:
+                        margin = 42.5
+                        available_w = page_w - 2 * margin
+                        available_h = page_h - 2 * margin
+                    else:
+                        margin = 0
+                        available_w = page_w
+                        available_h = page_h
+                    
+                    # 限制缩放比例不超过1.0，避免小图片被放大失真
+                    scale = min(available_w / w, available_h / h, 1.0)
                     new_w, new_h = w * scale, h * scale
                     x = (page_w - new_w) / 2
                     y = (page_h - new_h) / 2
@@ -306,7 +494,7 @@ def collect_dirs_to_process(src_root):
 def process_one_dir(args_tuple):
     # 记录单个目录处理开始时间
     dir_start_time = time.time()
-    current_dir, out_root, do_pdfa = args_tuple
+    current_dir, out_root, do_pdfa, delete_archive, archive_mapping = args_tuple
     try:
         images = gather_image_files_in_dir(current_dir)
         if not images:
@@ -348,6 +536,13 @@ def process_one_dir(args_tuple):
                 except Exception:
                     pass
                 return (current_dir, False, "pdfa_convert_failed")
+        
+        # ✅ PDF生成成功，删除对应的压缩包（如果启用）
+        if delete_archive:
+            archive_path = find_source_archive(current_dir, archive_mapping)
+            if archive_path and os.path.isfile(archive_path):
+                safe_delete_archive(archive_path, out_pdf)
+        
         # 计算并记录单个目录处理时间
         dir_elapsed_time = time.time() - dir_start_time
         dir_name = os.path.basename(os.path.normpath(current_dir))
@@ -358,7 +553,7 @@ def process_one_dir(args_tuple):
         return (current_dir, False, str(e))
 
 
-def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
+def process_recursive_parallel(src_root, out_root=None, do_pdfa=False, delete_archive=False, archive_mapping=None):
     # 记录总处理开始时间
     total_start_time = time.time()
     dirs = collect_dirs_to_process(src_root)
@@ -366,9 +561,14 @@ def process_recursive_parallel(src_root, out_root=None, do_pdfa=False):
     log_info(f"共发现 {total} 个含图片的子目录。")
     if total == 0:
         return
+    
+    # 如果没有提供映射字典，使用空字典
+    if archive_mapping is None:
+        archive_mapping = {}
+    
     max_workers = min(os.cpu_count() or 1, 8)
     log_info(f"开始并行处理（最大并发数 {max_workers}）")
-    tasks = [(d, out_root, do_pdfa) for d in dirs]
+    tasks = [(d, out_root, do_pdfa, delete_archive, archive_mapping) for d in dirs]
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_dir = {executor.submit(process_one_dir, t): t[0] for t in tasks}
         completed = 0
@@ -411,6 +611,16 @@ def main():
     parser.add_argument(
         "--pdfa", action="store_true", help="生成后使用 Ghostscript 转为 PDF/A-1b"
     )
+    parser.add_argument(
+        "--extract",
+        action="store_true",
+        help="自动解压源目录中的压缩包（ZIP）到同名文件夹"
+    )
+    parser.add_argument(
+        "--delete-archive",
+        action="store_true",
+        help="PDF生成成功后删除原压缩包（需配合 --extract 使用）"
+    )
     args = parser.parse_args()
     src = os.path.abspath(args.src)
     if not os.path.isdir(src):
@@ -429,6 +639,7 @@ def main():
         if not os.access(out_dir, os.W_OK):
             log_err(f"输出目录无写入权限：{out_dir}")
             sys.exit(4)
+    
     log_info(f"开始处理源目录：{src}")
     if out_dir:
         log_info(f"输出目录：{out_dir}")
@@ -436,7 +647,22 @@ def main():
         log_info("输出目录未指定，PDF 将生成在各自源子目录中。")
     if args.pdfa:
         log_info("已启用 PDF/A 转换（需要 Ghostscript）")
-    process_recursive_parallel(src, out_dir, args.pdfa)
+    
+    # 阶段1：解压压缩包（如果启用）
+    archive_mapping = {}
+    if args.extract:
+        log_info("=" * 60)
+        log_info("阶段 1：解压压缩包")
+        log_info("=" * 60)
+        success, skipped, failed, archive_mapping = extract_all_archives(src)
+        if args.delete_archive:
+            log_info("已启用：PDF生成成功后将自动删除原压缩包")
+    
+    # 阶段2：生成PDF
+    log_info("=" * 60)
+    log_info("阶段 2：生成 PDF")
+    log_info("=" * 60)
+    process_recursive_parallel(src, out_dir, args.pdfa, args.delete_archive, archive_mapping)
 
 
 if __name__ == "__main__":
