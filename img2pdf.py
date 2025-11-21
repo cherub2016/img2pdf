@@ -494,17 +494,27 @@ def collect_dirs_to_process(src_root):
 def process_one_dir(args_tuple):
     # 记录单个目录处理开始时间
     dir_start_time = time.time()
-    current_dir, out_root, do_pdfa, delete_archive, archive_mapping = args_tuple
+    current_dir, src_root, out_root, do_pdfa, delete_archive, archive_mapping, keep_structure = args_tuple
     try:
         images = gather_image_files_in_dir(current_dir)
         if not images:
             return (current_dir, False, "no_images")
         dir_name = os.path.basename(os.path.normpath(current_dir))
         pdf_name = f"{dir_name}.pdf"
+        
         if out_root:
-            os.makedirs(out_root, exist_ok=True)
-            out_pdf = os.path.join(out_root, pdf_name)
+            if keep_structure:
+                # 保持目录结构：计算相对路径
+                rel_path = os.path.relpath(current_dir, src_root)
+                out_dir = os.path.join(out_root, rel_path)
+                os.makedirs(out_dir, exist_ok=True)
+                out_pdf = os.path.join(out_dir, pdf_name)
+            else:
+                # 扁平化输出：所有PDF到同一目录
+                os.makedirs(out_root, exist_ok=True)
+                out_pdf = os.path.join(out_root, pdf_name)
         else:
+            # 未指定输出目录，PDF保存在源目录
             out_pdf = os.path.join(current_dir, pdf_name)
         
         # 检查目标PDF是否已存在
@@ -553,7 +563,7 @@ def process_one_dir(args_tuple):
         return (current_dir, False, str(e))
 
 
-def process_recursive_parallel(src_root, out_root=None, do_pdfa=False, delete_archive=False, archive_mapping=None):
+def process_recursive_parallel(src_root, out_root=None, do_pdfa=False, delete_archive=False, archive_mapping=None, keep_structure=False):
     # 记录总处理开始时间
     total_start_time = time.time()
     dirs = collect_dirs_to_process(src_root)
@@ -568,7 +578,14 @@ def process_recursive_parallel(src_root, out_root=None, do_pdfa=False, delete_ar
     
     max_workers = min(os.cpu_count() or 1, 8)
     log_info(f"开始并行处理（最大并发数 {max_workers}）")
-    tasks = [(d, out_root, do_pdfa, delete_archive, archive_mapping) for d in dirs]
+    
+    # 如果保持目录结构，显示提示信息
+    if keep_structure and out_root:
+        log_info("输出模式：保持源目录结构")
+    elif out_root:
+        log_info("输出模式：扁平化（所有PDF到同一目录）")
+    
+    tasks = [(d, src_root, out_root, do_pdfa, delete_archive, archive_mapping, keep_structure) for d in dirs]
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_dir = {executor.submit(process_one_dir, t): t[0] for t in tasks}
         completed = 0
@@ -621,6 +638,11 @@ def main():
         action="store_true",
         help="PDF生成成功后删除原压缩包（需配合 --extract 使用）"
     )
+    parser.add_argument(
+        "--keep-structure",
+        action="store_true",
+        help="保持源目录结构输出PDF（默认为扁平化输出）"
+    )
     args = parser.parse_args()
     src = os.path.abspath(args.src)
     if not os.path.isdir(src):
@@ -662,7 +684,7 @@ def main():
     log_info("=" * 60)
     log_info("阶段 2：生成 PDF")
     log_info("=" * 60)
-    process_recursive_parallel(src, out_dir, args.pdfa, args.delete_archive, archive_mapping)
+    process_recursive_parallel(src, out_dir, args.pdfa, args.delete_archive, archive_mapping, args.keep_structure)
 
 
 if __name__ == "__main__":
